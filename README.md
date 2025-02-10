@@ -62,3 +62,7 @@ available that allow interacting with the cluster:
 - **`<setup-name>-netmanager-push`**
   - Updates and restarts the `netmanager` service on all worker nodes.
   - Example: `$ oaks-1000-netmanager-push ./amd64-NetManager`
+
+## Architecture
+
+![Architecture Sketch](./assets/architecture.svg)
