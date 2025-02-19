@@ -107,3 +107,10 @@ variable "watchtower_ipv4_cidr" {
     error_message = "Currently only /30 subnets are supported."
   }
 }
+
+variable "debug_ports_enabled" {
+  type        = string
+  nullable    = false
+  default     = false
+  description = "If true, additional ports are exposed from Oakestra components for debugging purposes."
+}

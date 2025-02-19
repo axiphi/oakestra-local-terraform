@@ -119,8 +119,9 @@ resource "libvirt_cloudinit_disk" "registry" {
         content = yamlencode({
           services = {
             "registry-local" = {
-              image = "registry:2.8.3"
-              ports = ["${local.registry_local_port}:5000"]
+              image   = "registry:2.8.3"
+              restart = "always"
+              ports   = ["${local.registry_local_port}:5000"]
               configs = [
                 {
                   source = "registry-config-local"
@@ -137,8 +138,9 @@ resource "libvirt_cloudinit_disk" "registry" {
               ]
             }
             "registry-docker-hub" = {
-              image = "registry:2.8.3"
-              ports = ["${local.registry_docker_hub_port}:5000"]
+              image   = "registry:2.8.3"
+              restart = "always"
+              ports   = ["${local.registry_docker_hub_port}:5000"]
               configs = [
                 {
                   source = "registry-config-docker-hub"
@@ -155,8 +157,9 @@ resource "libvirt_cloudinit_disk" "registry" {
               ]
             }
             "registry-ghcr-io" = {
-              image = "registry:2.8.3"
-              ports = ["${local.registry_ghcr_io_port}:5000"]
+              image   = "registry:2.8.3"
+              restart = "always"
+              ports   = ["${local.registry_ghcr_io_port}:5000"]
               configs = [
                 {
                   source = "registry-config-ghcr-io"
@@ -266,7 +269,7 @@ resource "libvirt_cloudinit_disk" "registry" {
         EOT
         owner       = "root:root"
         permissions = "0644"
-      },
+      }
     ]
     runcmd = ["systemctl enable --now oakestra-registries"]
   })])
