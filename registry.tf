@@ -1,3 +1,42 @@
+locals {
+  # Most of this is copied from the defaults of the registry image.
+  # Modified/added values are marked.
+  shared_registry_config = {
+    version = 0.1
+    log = {
+      fields = {
+        service = "registry"
+      }
+    }
+    storage = {
+      cache = {
+        blobdescriptor = "inmemory"
+      }
+      filesystem = {
+        rootdirectory = "/var/lib/registry"
+      }
+    }
+    health = {
+      storagedriver = {
+        enabled   = true
+        interval  = "10s"
+        threshold = 3
+      }
+    }
+    http = {
+      addr = ":5000"
+      headers = {
+        "X-Content-Type-Options" = ["nosniff"]
+      }
+      # Added: Configure TLS.
+      tls = {
+        certificate = "/etc/docker/registry/cert.pem"
+        key         = "/etc/docker/registry/key.pem"
+      }
+    }
+  }
+}
+
 resource "libvirt_volume" "registry" {
   name           = "registry.iso"
   pool           = libvirt_pool.oakestra_dev.name
@@ -29,60 +68,22 @@ resource "libvirt_cloudinit_disk" "registry" {
       "containerd.io",
       "kitty-terminfo"
     ]
+    growpart = {
+      mode    = "auto"
+      devices = ["/"]
+    }
+    disable_root = false
+    users = [
+      {
+        name                = "root"
+        ssh_authorized_keys = [chomp(tls_private_key.ssh_client.public_key_openssh)]
+      }
+    ]
+    ssh_keys = {
+      ed25519_private = tls_private_key.ssh_server.private_key_openssh
+      ed25519_public  = tls_private_key.ssh_server.public_key_openssh
+    }
     write_files = [
-      {
-        path = "/etc/systemd/system/docker.service.d/override.conf"
-        # Having options in /etc/docker/daemon.json, conflicts with passing command line arguments to dockerd,
-        # so we override the systemd service to not pass any.
-        content     = <<-EOT
-          [Service]
-          ExecStart=
-          ExecStart=/usr/bin/dockerd
-        EOT
-        owner       = "root:root"
-        permissions = "0644"
-      },
-      {
-        path = "/etc/docker/daemon.json"
-        content = jsonencode({
-          containerd = "/run/containerd/containerd.sock"
-          hosts = [
-            "tcp://0.0.0.0:2375",
-            "fd://"
-          ]
-          tls       = true
-          tlsverify = true
-          tlscert   = "/etc/docker/cert.pem"
-          tlskey    = "/etc/docker/key.pem"
-          tlscacert = "/etc/docker/ca.pem"
-        })
-        owner       = "root:root"
-        permissions = "0644"
-      },
-      {
-        path        = "/etc/docker/cert.pem"
-        content     = tls_self_signed_cert.docker_server.cert_pem
-        owner       = "root:root"
-        permissions = "0644"
-      },
-      {
-        path        = "/etc/docker/key.pem"
-        content     = tls_self_signed_cert.docker_server.private_key_pem
-        owner       = "root:root"
-        permissions = "0600"
-      },
-      {
-        path        = "/etc/docker/ca.pem"
-        content     = tls_self_signed_cert.docker_client.cert_pem
-        owner       = "root:root"
-        permissions = "0644"
-      },
-      {
-        path        = "/etc/docker/certs.d/localhost:${local.registry_local_port}/ca.crt"
-        content     = tls_self_signed_cert.docker_server.cert_pem
-        owner       = "root:root"
-        permissions = "0644"
-      },
       {
         path        = "/usr/local/bin/wait-for-it.sh",
         content     = file("${path.module}/resources/wait-for-it.sh")
@@ -112,23 +113,162 @@ resource "libvirt_cloudinit_disk" "registry" {
         EOT
         owner       = "root:root"
         permissions = "0755"
-      }
-    ]
-    growpart = {
-      mode    = "auto"
-      devices = ["/"]
-    }
-    disable_root = false
-    users = [
+      },
       {
-        name                = "root"
-        ssh_authorized_keys = [chomp(tls_private_key.ssh_client.public_key_openssh)]
-      }
+        path = "/etc/docker-compose/oakestra-registries/docker-compose.yml",
+        content = yamlencode({
+          services = {
+            "registry-local" = {
+              image = "registry:2.8.3"
+              ports = ["${local.registry_local_port}:5000"]
+              configs = [
+                {
+                  source = "registry-config-local"
+                  target = "/etc/docker/registry/config.yml"
+                },
+                {
+                  source = "registry-cert"
+                  target = "/etc/docker/registry/cert.pem"
+                },
+                {
+                  source = "registry-key"
+                  target = "/etc/docker/registry/key.pem"
+                }
+              ]
+            }
+            "registry-docker-hub" = {
+              image = "registry:2.8.3"
+              ports = ["${local.registry_docker_hub_port}:5000"]
+              configs = [
+                {
+                  source = "registry-config-docker-hub"
+                  target = "/etc/docker/registry/config.yml"
+                },
+                {
+                  source = "registry-cert"
+                  target = "/etc/docker/registry/cert.pem"
+                },
+                {
+                  source = "registry-key"
+                  target = "/etc/docker/registry/key.pem"
+                }
+              ]
+            }
+            "registry-ghcr-io" = {
+              image = "registry:2.8.3"
+              ports = ["${local.registry_ghcr_io_port}:5000"]
+              configs = [
+                {
+                  source = "registry-config-ghcr-io"
+                  target = "/etc/docker/registry/config.yml"
+                },
+                {
+                  source = "registry-cert"
+                  target = "/etc/docker/registry/cert.pem"
+                },
+                {
+                  source = "registry-key"
+                  target = "/etc/docker/registry/key.pem"
+                }
+              ]
+            }
+          }
+          configs = {
+            "registry-config-local" = {
+              content = yamlencode(merge(local.shared_registry_config, {
+                notifications = {
+                  endpoints = concat(
+                    [{
+                      name = "watchtower-root-orc"
+                      url  = "http://${local.root_orc_hostname}:${local.watchtower_port}/v1/update"
+                      headers = {
+                        "Authorization" = ["Bearer ${random_password.watchtower.result}"]
+                      }
+                      timeout   = "30s"
+                      threshold = 3
+                      backoff   = "30s"
+                      ignore = {
+                        actions    = ["pull"]
+                        mediatypes = ["application/octet-stream"]
+                      }
+                    }],
+                    [for cluster in local.clusters : {
+                      name = "watchtower-${cluster.name}"
+                      url  = "http://${cluster.hostname}:${local.watchtower_port}/v1/update"
+                      headers = {
+                        "Authorization" = ["Bearer ${random_password.watchtower.result}"]
+                      }
+                      timeout   = "30s"
+                      threshold = 3
+                      backoff   = "30s"
+                      ignore = {
+                        actions    = ["pull"]
+                        mediatypes = ["application/octet-stream"]
+                      }
+                    }]
+                  )
+                }
+              }))
+            }
+            "registry-config-docker-hub" = {
+              content = yamlencode(merge(local.shared_registry_config, {
+                proxy = {
+                  remoteurl = "https://registry-1.docker.io"
+                }
+              }))
+            }
+            "registry-config-ghcr-io" = {
+              content = yamlencode(merge(local.shared_registry_config, {
+                proxy = {
+                  remoteurl = "https://ghcr.io"
+                }
+              }))
+            }
+            "registry-cert" = {
+              content = tls_self_signed_cert.docker_server.cert_pem
+            }
+            "registry-key" = {
+              content = tls_self_signed_cert.docker_server.private_key_pem
+            }
+          }
+          networks = {
+            default = {
+              ipam = {
+                config = [
+                  {
+                    subnet = var.container_ipv4_cidr
+                  }
+                ]
+              }
+            }
+          }
+        })
+        owner       = "root:root"
+        permissions = "0644"
+      },
+      {
+        path        = "/usr/local/lib/systemd/system/oakestra-registries.service"
+        content     = <<-EOT
+          [Unit]
+          Description=Oakestra Development Container Registries (via Docker Compose)
+          After=docker.service
+          Requires=docker.service
+
+          [Service]
+          Type=simple
+          Restart=always
+          WorkingDirectory=/etc/docker-compose/oakestra-registries
+          ExecStart=/usr/bin/docker compose up
+          ExecStop=/usr/bin/docker compose down
+
+          [Install]
+          WantedBy=multi-user.target
+        EOT
+        owner       = "root:root"
+        permissions = "0644"
+      },
     ]
-    ssh_keys = {
-      ed25519_private = tls_private_key.ssh_server.private_key_openssh
-      ed25519_public  = tls_private_key.ssh_server.public_key_openssh
-    }
+    runcmd = ["systemctl enable --now oakestra-registries"]
   })])
   network_config = file("${path.module}/resources/ubuntu-network.yml")
 }
@@ -169,344 +309,17 @@ resource "libvirt_domain" "registry" {
   provisioner "remote-exec" {
     inline = [
       "echo 'Waiting for cloud-init to finish...'",
-      "cloud-init status --wait > /dev/null",
+      "cloud-init status --wait > /dev/null || exit 1",
       "echo 'Done with waiting for cloud-init.'",
+      "echo 'Waiting for registries to come up...'",
+      "wait-for-it.sh -q -t 60 localhost:${local.registry_local_port} || exit 1",
+      "wait-for-it.sh -q -t 60 localhost:${local.registry_docker_hub_port} || exit 1",
+      "wait-for-it.sh -q -t 60 localhost:${local.registry_ghcr_io_port} || exit 1",
+      "echo 'Done with waiting for registries.'",
     ]
   }
 
   lifecycle {
     replace_triggered_by = [libvirt_cloudinit_disk.registry]
-  }
-}
-
-locals {
-  registry_docker_host = "tcp://${libvirt_domain.registry.network_interface[0].addresses[0]}:2375"
-}
-
-resource "docker_network" "registry" {
-  name = "registry"
-
-  override {
-    host          = local.registry_docker_host
-    cert_material = tls_self_signed_cert.docker_client.cert_pem
-    key_material  = tls_self_signed_cert.docker_client.private_key_pem
-    ca_material   = tls_self_signed_cert.docker_server.cert_pem
-  }
-}
-
-resource "docker_image" "registry" {
-  name = "registry:2.8.3"
-
-  override {
-    host          = local.registry_docker_host
-    cert_material = tls_self_signed_cert.docker_client.cert_pem
-    key_material  = tls_self_signed_cert.docker_client.private_key_pem
-    ca_material   = tls_self_signed_cert.docker_server.cert_pem
-  }
-}
-
-resource "docker_container" "registry_local" {
-  name  = "registry-local"
-  image = docker_image.registry.image_id
-
-  networks_advanced {
-    name = docker_network.registry.id
-  }
-
-  upload {
-    file = "/etc/docker/registry/config.yml"
-    # Most of the content is copied from the defaults of the image.
-    # Modified/added values are marked.
-    content = yamlencode({
-      version = 0.1
-      log = {
-        fields = {
-          service = "registry"
-        }
-      }
-      storage = {
-        cache = {
-          blobdescriptor = "inmemory"
-        }
-        filesystem = {
-          rootdirectory = "/var/lib/registry"
-        }
-      }
-      health = {
-        storagedriver = {
-          enabled   = true
-          interval  = "10s"
-          threshold = 3
-        }
-      }
-      http = {
-        addr = ":5000"
-        headers = {
-          "X-Content-Type-Options" = ["nosniff"]
-        }
-        # Added: Configure TLS.
-        tls = {
-          certificate = "/etc/docker/registry/cert.pem"
-          key         = "/etc/docker/registry/key.pem"
-        }
-      }
-      # Added: notifications (web-hooks)
-      notifications = {
-        endpoints = concat(
-          [{
-            name = "watchtower-root-orc"
-            url  = "http://${local.root_orc_hostname}:${local.watchtower_port}/v1/update"
-            headers = {
-              "Authorization" = ["Bearer ${random_password.watchtower.result}"]
-            }
-            timeout   = "30s"
-            threshold = 3
-            backoff   = "30s"
-            ignore = {
-              actions    = ["pull"]
-              mediatypes = ["application/octet-stream"]
-            }
-          }],
-          [for cluster in local.clusters : {
-            name = "watchtower-${cluster.name}"
-            url  = "http://${cluster.hostname}:${local.watchtower_port}/v1/update"
-            headers = {
-              "Authorization" = ["Bearer ${random_password.watchtower.result}"]
-            }
-            timeout   = "30s"
-            threshold = 3
-            backoff   = "30s"
-            ignore = {
-              actions    = ["pull"]
-              mediatypes = ["application/octet-stream"]
-            }
-          }]
-        )
-      }
-    })
-  }
-
-  upload {
-    file    = "/etc/docker/registry/cert.pem"
-    content = tls_self_signed_cert.docker_server.cert_pem
-  }
-
-  upload {
-    file    = "/etc/docker/registry/key.pem"
-    content = tls_self_signed_cert.docker_server.private_key_pem
-  }
-
-  ports {
-    internal = 5000
-    external = local.registry_local_port
-  }
-
-  override {
-    host          = local.registry_docker_host
-    cert_material = tls_self_signed_cert.docker_client.cert_pem
-    key_material  = tls_self_signed_cert.docker_client.private_key_pem
-    ca_material   = tls_self_signed_cert.docker_server.cert_pem
-  }
-
-  connection {
-    type        = "ssh"
-    host        = libvirt_domain.registry.network_interface[0].addresses[0]
-    user        = "root"
-    private_key = tls_private_key.ssh_client.private_key_openssh
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "wait-for-it.sh localhost:${self.ports[0].external}"
-    ]
-  }
-
-  lifecycle {
-    ignore_changes = [network_mode]
-  }
-}
-
-resource "docker_container" "registry_docker_hub" {
-  name  = "registry-docker-hub"
-  image = docker_image.registry.image_id
-
-  networks_advanced {
-    name = docker_network.registry.id
-  }
-
-  upload {
-    file = "/etc/docker/registry/config.yml"
-    # Most of the content is copied from the defaults of the image.
-    # Modified/added values are marked.
-    content = yamlencode({
-      version = 0.1
-      log = {
-        fields = {
-          service = "registry"
-        }
-      }
-      storage = {
-        cache = {
-          blobdescriptor = "inmemory"
-        }
-        filesystem = {
-          rootdirectory = "/var/lib/registry"
-        }
-      }
-      health = {
-        storagedriver = {
-          enabled   = true
-          interval  = "10s"
-          threshold = 3
-        }
-      }
-      http = {
-        addr = ":5000"
-        headers = {
-          "X-Content-Type-Options" = ["nosniff"]
-        }
-        # Added: Configure TLS.
-        tls = {
-          certificate = "/etc/docker/registry/cert.pem"
-          key         = "/etc/docker/registry/key.pem"
-        }
-      }
-      # Added: Configure read-through proxy.
-      proxy = {
-        remoteurl = "https://registry-1.docker.io"
-      }
-    })
-  }
-
-  upload {
-    file    = "/etc/docker/registry/cert.pem"
-    content = tls_self_signed_cert.docker_server.cert_pem
-  }
-
-  upload {
-    file    = "/etc/docker/registry/key.pem"
-    content = tls_self_signed_cert.docker_server.private_key_pem
-  }
-
-  ports {
-    internal = 5000
-    external = local.registry_docker_hub_port
-  }
-
-  override {
-    host          = local.registry_docker_host
-    cert_material = tls_self_signed_cert.docker_client.cert_pem
-    key_material  = tls_self_signed_cert.docker_client.private_key_pem
-    ca_material   = tls_self_signed_cert.docker_server.cert_pem
-  }
-
-  connection {
-    type        = "ssh"
-    host        = libvirt_domain.registry.network_interface[0].addresses[0]
-    user        = "root"
-    private_key = tls_private_key.ssh_client.private_key_openssh
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "wait-for-it.sh localhost:${self.ports[0].external}"
-    ]
-  }
-
-  lifecycle {
-    ignore_changes = [network_mode]
-  }
-}
-
-resource "docker_container" "registry_ghcr_io" {
-  name  = "registry-ghcr-io"
-  image = docker_image.registry.image_id
-
-  networks_advanced {
-    name = docker_network.registry.id
-  }
-
-  upload {
-    file = "/etc/docker/registry/config.yml"
-    # Most of the content is copied from the defaults of the image.
-    # Modified/added values are marked.
-    content = yamlencode({
-      version = 0.1
-      log = {
-        fields = {
-          service = "registry"
-        }
-        level = "debug"
-      }
-      storage = {
-        cache = {
-          blobdescriptor = "inmemory"
-        }
-        filesystem = {
-          rootdirectory = "/var/lib/registry"
-        }
-      }
-      health = {
-        storagedriver = {
-          enabled   = true
-          interval  = "10s"
-          threshold = 3
-        }
-      }
-      http = {
-        addr = ":5000"
-        headers = {
-          "X-Content-Type-Options" = ["nosniff"]
-        }
-        # Added: Configure TLS.
-        tls = {
-          certificate = "/etc/docker/registry/cert.pem"
-          key         = "/etc/docker/registry/key.pem"
-        }
-      }
-      # Added: Configure read-through proxy.
-      proxy = {
-        remoteurl = "https://ghcr.io"
-      }
-    })
-  }
-
-  upload {
-    file    = "/etc/docker/registry/cert.pem"
-    content = tls_self_signed_cert.docker_server.cert_pem
-  }
-
-  upload {
-    file    = "/etc/docker/registry/key.pem"
-    content = tls_self_signed_cert.docker_server.private_key_pem
-  }
-
-  ports {
-    internal = 5000
-    external = local.registry_ghcr_io_port
-  }
-
-  override {
-    host          = local.registry_docker_host
-    cert_material = tls_self_signed_cert.docker_client.cert_pem
-    key_material  = tls_self_signed_cert.docker_client.private_key_pem
-    ca_material   = tls_self_signed_cert.docker_server.cert_pem
-  }
-
-  connection {
-    type        = "ssh"
-    host        = libvirt_domain.registry.network_interface[0].addresses[0]
-    user        = "root"
-    private_key = tls_private_key.ssh_client.private_key_openssh
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "wait-for-it.sh localhost:${self.ports[0].external}"
-    ]
-  }
-
-  lifecycle {
-    ignore_changes = [network_mode]
   }
 }

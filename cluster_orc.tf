@@ -46,16 +46,16 @@ resource "libvirt_cloudinit_disk" "cluster_orc" {
           tlskey    = "/etc/docker/key.pem"
           tlscacert = "/etc/docker/ca.pem"
           "registry-mirrors" = [
-            "https://${libvirt_domain.registry.network_interface[0].hostname}:${docker_container.registry_local.ports[0].external}",
-            "https://${libvirt_domain.registry.network_interface[0].hostname}:${docker_container.registry_docker_hub.ports[0].external}",
-            "https://${libvirt_domain.registry.network_interface[0].hostname}:${docker_container.registry_ghcr_io.ports[0].external}"
+            "https://${libvirt_domain.registry.network_interface[0].hostname}:${local.registry_local_port}",
+            "https://${libvirt_domain.registry.network_interface[0].hostname}:${local.registry_docker_hub_port}",
+            "https://${libvirt_domain.registry.network_interface[0].hostname}:${local.registry_ghcr_io_port}"
           ]
           # Setting up proper certificate validation shouldn't be necessary for this, but here is the docs for it:
           # https://docs.docker.com/engine/security/certificates/
           "insecure-registries" = [
-            "${libvirt_domain.registry.network_interface[0].hostname}:${docker_container.registry_local.ports[0].external}",
-            "${libvirt_domain.registry.network_interface[0].hostname}:${docker_container.registry_docker_hub.ports[0].external}",
-            "${libvirt_domain.registry.network_interface[0].hostname}:${docker_container.registry_ghcr_io.ports[0].external}"
+            "${libvirt_domain.registry.network_interface[0].hostname}:${local.registry_local_port}",
+            "${libvirt_domain.registry.network_interface[0].hostname}:${local.registry_docker_hub_port}",
+            "${libvirt_domain.registry.network_interface[0].hostname}:${local.registry_ghcr_io_port}"
           ]
         })
         owner       = "root:root"
@@ -216,7 +216,7 @@ resource "docker_image" "cluster_watchtower" {
     ca_material   = tls_self_signed_cert.docker_server.cert_pem
   }
 
-  depends_on = [docker_container.registry_docker_hub]
+  depends_on = [libvirt_domain.registry]
 }
 
 resource "docker_image" "cluster_mongo" {
@@ -230,7 +230,7 @@ resource "docker_image" "cluster_mongo" {
     ca_material   = tls_self_signed_cert.docker_server.cert_pem
   }
 
-  depends_on = [docker_container.registry_docker_hub]
+  depends_on = [libvirt_domain.registry]
 }
 
 resource "docker_image" "cluster_redis" {
@@ -244,7 +244,7 @@ resource "docker_image" "cluster_redis" {
     ca_material   = tls_self_signed_cert.docker_server.cert_pem
   }
 
-  depends_on = [docker_container.registry_docker_hub]
+  depends_on = [libvirt_domain.registry]
 }
 
 resource "docker_image" "cluster_mqtt" {
@@ -258,7 +258,7 @@ resource "docker_image" "cluster_mqtt" {
     ca_material   = tls_self_signed_cert.docker_server.cert_pem
   }
 
-  depends_on = [docker_container.registry_docker_hub]
+  depends_on = [libvirt_domain.registry]
 }
 
 resource "docker_container" "cluster_watchtower" {
@@ -343,7 +343,7 @@ resource "docker_container" "cluster_scheduler" {
     replace_triggered_by = [null_resource.oakestra_version]
   }
 
-  depends_on = [docker_container.registry_local, docker_container.registry_ghcr_io]
+  depends_on = [libvirt_domain.registry]
 }
 
 resource "docker_container" "cluster_service_manager" {
@@ -384,7 +384,7 @@ resource "docker_container" "cluster_service_manager" {
     replace_triggered_by = [null_resource.oakestra_version]
   }
 
-  depends_on = [docker_container.registry_local, docker_container.registry_ghcr_io]
+  depends_on = [libvirt_domain.registry]
 }
 
 resource "docker_container" "cluster_manager" {
@@ -434,7 +434,7 @@ resource "docker_container" "cluster_manager" {
     replace_triggered_by = [null_resource.oakestra_version]
   }
 
-  depends_on = [docker_container.registry_local, docker_container.registry_ghcr_io]
+  depends_on = [libvirt_domain.registry]
 }
 
 resource "docker_container" "cluster_mongo" {

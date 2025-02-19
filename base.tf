@@ -155,8 +155,8 @@ resource "libvirt_pool" "oakestra_dev" {
 }
 
 resource "libvirt_volume" "ubuntu_24_04" {
-  name = "ubuntu-24-04.iso"
-  pool = libvirt_pool.oakestra_dev.name
+  name   = "ubuntu-24-04.iso"
+  pool   = libvirt_pool.oakestra_dev.name
   source = "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
   format = "qcow2"
 }
