@@ -62,12 +62,12 @@ resource "libvirt_cloudinit_disk" "registry" {
       }
     }
     package_update = true
-    packages = [
+    packages = concat(var.additional_packages, [
       "docker-ce",
       "docker-ce-cli",
       "containerd.io",
-      "kitty-terminfo"
-    ]
+      "docker-compose-plugin"
+    ])
     growpart = {
       mode    = "auto"
       devices = ["/"]
@@ -181,34 +181,38 @@ resource "libvirt_cloudinit_disk" "registry" {
               content = yamlencode(merge(local.shared_registry_config, {
                 notifications = {
                   endpoints = concat(
-                    [{
-                      name = "watchtower-root-orc"
-                      url  = "http://${local.root_orc_hostname}:${local.watchtower_port}/v1/update"
-                      headers = {
-                        "Authorization" = ["Bearer ${random_password.watchtower.result}"]
+                    [
+                      {
+                        name = "watchtower-root-orc"
+                        url  = "http://${local.root_orc_ipv4}:${local.watchtower_port}/v1/update"
+                        headers = {
+                          "Authorization" = ["Bearer ${random_password.watchtower.result}"]
+                        }
+                        timeout   = "30s"
+                        threshold = 3
+                        backoff   = "30s"
+                        ignore = {
+                          actions    = ["pull"]
+                          mediatypes = ["application/octet-stream"]
+                        }
                       }
-                      timeout   = "30s"
-                      threshold = 3
-                      backoff   = "30s"
-                      ignore = {
-                        actions    = ["pull"]
-                        mediatypes = ["application/octet-stream"]
+                    ],
+                    [
+                      for cluster in local.clusters : {
+                        name = "watchtower-${cluster.name}-orc"
+                        url  = "http://${cluster.orc_ipv4}:${local.watchtower_port}/v1/update"
+                        headers = {
+                          "Authorization" = ["Bearer ${random_password.watchtower.result}"]
+                        }
+                        timeout   = "30s"
+                        threshold = 3
+                        backoff   = "30s"
+                        ignore = {
+                          actions    = ["pull"]
+                          mediatypes = ["application/octet-stream"]
+                        }
                       }
-                    }],
-                    [for cluster in local.clusters : {
-                      name = "watchtower-${cluster.name}"
-                      url  = "http://${cluster.hostname}:${local.watchtower_port}/v1/update"
-                      headers = {
-                        "Authorization" = ["Bearer ${random_password.watchtower.result}"]
-                      }
-                      timeout   = "30s"
-                      threshold = 3
-                      backoff   = "30s"
-                      ignore = {
-                        actions    = ["pull"]
-                        mediatypes = ["application/octet-stream"]
-                      }
-                    }]
+                    ]
                   )
                 }
               }))
@@ -228,10 +232,10 @@ resource "libvirt_cloudinit_disk" "registry" {
               }))
             }
             "registry-cert" = {
-              content = tls_self_signed_cert.docker_server.cert_pem
+              content = tls_self_signed_cert.registry.cert_pem
             }
             "registry-key" = {
-              content = tls_self_signed_cert.docker_server.private_key_pem
+              content = tls_self_signed_cert.registry.private_key_pem
             }
           }
           networks = {
@@ -239,7 +243,7 @@ resource "libvirt_cloudinit_disk" "registry" {
               ipam = {
                 config = [
                   {
-                    subnet = var.container_ipv4_cidr
+                    subnet = var.container_subnet_ipv4_cidr
                   }
                 ]
               }
@@ -269,6 +273,14 @@ resource "libvirt_cloudinit_disk" "registry" {
         EOT
         owner       = "root:root"
         permissions = "0644"
+      },
+      {
+        path        = "/root/.bashrc"
+        content     = <<-EOT
+            cd /etc/docker-compose/oakestra-registries
+          EOT
+        owner       = "root:root"
+        permissions = "0644"
       }
     ]
     runcmd = ["systemctl enable --now oakestra-registries"]
@@ -277,10 +289,14 @@ resource "libvirt_cloudinit_disk" "registry" {
 }
 
 resource "libvirt_domain" "registry" {
-  name      = "${local.setup_name}-registry"
-  memory    = 4096
-  vcpu      = 2
+  name      = "${var.setup_name}-registry"
+  memory    = var.registry_memory
+  vcpu      = var.registry_vcpu
   cloudinit = libvirt_cloudinit_disk.registry.id
+
+  cpu {
+    mode = "host-model"
+  }
 
   disk {
     volume_id = libvirt_volume.registry.id
@@ -304,16 +320,13 @@ resource "libvirt_domain" "registry" {
 
   connection {
     type        = "ssh"
-    host        = self.network_interface[0].addresses[0]
+    host        = local.registry_ipv4
     user        = "root"
     private_key = tls_private_key.ssh_client.private_key_openssh
   }
 
   provisioner "remote-exec" {
     inline = [
-      "echo 'Waiting for cloud-init to finish...'",
-      "cloud-init status --wait > /dev/null || exit 1",
-      "echo 'Done with waiting for cloud-init.'",
       "echo 'Waiting for registries to come up...'",
       "wait-for-it.sh -q -t 60 localhost:${local.registry_local_port} || exit 1",
       "wait-for-it.sh -q -t 60 localhost:${local.registry_docker_hub_port} || exit 1",

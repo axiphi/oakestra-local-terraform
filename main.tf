@@ -31,18 +31,9 @@ terraform {
       source  = "dmacvicar/libvirt"
       version = ">=0.8.1"
     }
-
-    docker = {
-      source  = "bierwirth-it/docker"
-      version = ">=3.0.5"
-    }
   }
 }
 
 provider "libvirt" {
   uri = "qemu:///system"
-}
-
-provider "docker" {
-  host = "unix:///var/run/docker.sock"
 }

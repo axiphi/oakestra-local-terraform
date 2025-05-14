@@ -9,6 +9,65 @@ resource "libvirt_volume" "root_orc" {
   }
 }
 
+locals {
+  root_orc_compose_base = yamldecode(file("${path.module}/resources/root-orc.docker-compose.yml"))
+  root_orc_compose_full = merge(
+    local.root_orc_compose_base,
+    {
+      services = merge(lookup(local.root_orc_compose_base, "services", {}), {
+        watchtower = {
+          image   = "containrrr/watchtower:1.7.1"
+          restart = "always"
+          environment = [
+            # the local docker registry notifies watchtower when an image was uploaded
+            "WATCHTOWER_HTTP_API_UPDATE=true",
+            "WATCHTOWER_HTTP_API_TOKEN=${random_password.watchtower.result}",
+            # we're only updating oakestra containers, which we explicitly label
+            "WATCHTOWER_LABEL_ENABLE=true",
+            # no need to keep unused images
+            "WATCHTOWER_CLEANUP=true",
+            # we're only updating stateless containers, so this should help with removing temporary state
+            "WATCHTOWER_REMOVE_VOLUMES=true",
+            # when a faulty image is uploaded that keeps crashing its container, this will allow fixing it by uploading again
+            "WATCHTOWER_INCLUDE_RESTARTING=true",
+            # we block watchtower's head requests on purpose, so errors are expected
+            "WATCHTOWER_WARN_ON_HEAD_FAILURE=never"
+          ]
+          ports = ["${local.watchtower_port}:8080"]
+          volumes = [{
+            type   = "bind"
+            source = "/var/run/docker.sock"
+            target = "/var/run/docker.sock"
+          }]
+          networks = ["watchtower"]
+        }
+      })
+      networks = merge(lookup(local.root_orc_compose_base, "networks", {}), {
+        default = {
+          ipam = {
+            config = [
+              {
+                subnet = var.container_subnet_ipv4_cidr
+              }
+            ]
+          }
+        }
+        watchtower = {
+          ipam = {
+            config = [
+              {
+                subnet   = var.watchtower_subnet_ipv4_cidr
+                gateway  = cidrhost(var.watchtower_subnet_ipv4_cidr, 1)
+                ip_range = cidrsubnet(var.watchtower_subnet_ipv4_cidr, 2, 2)
+              }
+            ]
+          }
+        }
+      })
+    }
+  )
+}
+
 resource "libvirt_cloudinit_disk" "root_orc" {
   name = "root-orc-init.iso"
   pool = libvirt_pool.oakestra_dev.name
@@ -23,13 +82,13 @@ resource "libvirt_cloudinit_disk" "root_orc" {
       }
     }
     package_update = true
-    packages = [
+    packages = concat(var.additional_packages, [
+      "iptables-persistent",
       "docker-ce",
       "docker-ce-cli",
       "containerd.io",
-      "iptables-persistent",
-      "kitty-terminfo"
-    ]
+      "docker-compose-plugin"
+    ])
     growpart = {
       mode    = "auto"
       devices = ["/"]
@@ -64,16 +123,16 @@ resource "libvirt_cloudinit_disk" "root_orc" {
           containerd = "/run/containerd/containerd.sock"
           hosts      = ["fd://"]
           "registry-mirrors" = [
-            "https://${local.registry_hostname}:${local.registry_local_port}",
-            "https://${local.registry_hostname}:${local.registry_docker_hub_port}",
-            "https://${local.registry_hostname}:${local.registry_ghcr_io_port}"
+            "https://${local.registry_ipv4}:${local.registry_local_port}",
+            "https://${local.registry_ipv4}:${local.registry_docker_hub_port}",
+            "https://${local.registry_ipv4}:${local.registry_ghcr_io_port}"
           ]
           # Setting up proper certificate validation shouldn't be necessary for this, but here is the docs for it:
           # https://docs.docker.com/engine/security/certificates/
           "insecure-registries" = [
-            "${local.registry_hostname}:${local.registry_local_port}",
-            "${local.registry_hostname}:${local.registry_docker_hub_port}",
-            "${local.registry_hostname}:${local.registry_ghcr_io_port}"
+            "${local.registry_ipv4}:${local.registry_local_port}",
+            "${local.registry_ipv4}:${local.registry_docker_hub_port}",
+            "${local.registry_ipv4}:${local.registry_ghcr_io_port}"
           ]
         })
         owner       = "root:root"
@@ -89,164 +148,26 @@ resource "libvirt_cloudinit_disk" "root_orc" {
         content     = <<-EOT
           *filter
           :DOCKER-USER - [0:0]
-          -A DOCKER-USER -s ${cidrsubnet(var.watchtower_ipv4_cidr, 2, 2)} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-          -A DOCKER-USER -s ${cidrsubnet(var.watchtower_ipv4_cidr, 2, 2)} -j DROP
-          -A DOCKER-USER -j RETURN
+          -A DOCKER-USER -s ${cidrsubnet(var.watchtower_subnet_ipv4_cidr, 2, 2)} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          -A DOCKER-USER -s ${cidrsubnet(var.watchtower_subnet_ipv4_cidr, 2, 2)} -j REJECT
           COMMIT
         EOT
         owner       = "root:root"
         permissions = "0640"
       },
       {
-        path = "/etc/docker-compose/oakestra-root-orc/docker-compose.yml",
-        content = yamlencode({
-          services = {
-            "watchtower" = {
-              image   = "containrrr/watchtower:1.7.1"
-              restart = "always"
-              ports   = ["${local.watchtower_port}:8080"]
-              environment = [
-                # the local docker registry notifies watchtower when an image was uploaded
-                "WATCHTOWER_HTTP_API_UPDATE=true",
-                "WATCHTOWER_HTTP_API_TOKEN=${random_password.watchtower.result}",
-                # we're only updating oakestra containers, which we explicitly label
-                "WATCHTOWER_LABEL_ENABLE=true",
-                # no need to keep unused images
-                "WATCHTOWER_CLEANUP=true",
-                # we're only updating stateless containers, so this should help with removing temporary state
-                "WATCHTOWER_REMOVE_VOLUMES=true",
-                # when a faulty image is uploaded that keeps crashing its container, this will allow fixing it by uploading again
-                "WATCHTOWER_INCLUDE_RESTARTING=true",
-                # we block watchtower's head requests on purpose, so errors are expected
-                "WATCHTOWER_WARN_ON_HEAD_FAILURE=never"
-              ]
-              volumes = [{
-                type   = "bind"
-                source = "/var/run/docker.sock"
-                target = "/var/run/docker.sock"
-              }]
-              networks = ["watchtower"]
-            }
-            "root-system-manager" = {
-              image   = "oakestra/oakestra/root-system-manager:${var.oakestra_version}"
-              restart = "always"
-              ports = [
-                "10000:10000",
-                "50052:50052"
-              ]
-              environment = [
-                "CLOUD_MONGO_URL=root-mongo",
-                "CLOUD_MONGO_PORT=10007",
-                "CLOUD_SCHEDULER_URL=cloud-scheduler",
-                "CLOUD_SCHEDULER_PORT=10004",
-                "RESOURCE_ABSTRACTOR_URL=root-resource-abstractor",
-                "RESOURCE_ABSTRACTOR_PORT=11011",
-                "NET_PLUGIN_URL=root-service-manager",
-                "NET_PLUGIN_PORT=10099"
-              ]
-              labels = {
-                "com.centurylinklabs.watchtower.enable" = "true"
-              }
-            }
-            "root-resource-abstractor" = {
-              image   = "oakestra/oakestra/root-resource-abstractor:${var.oakestra_version}"
-              restart = "always"
-              ports   = var.debug_ports_enabled ? ["11011:11011"] : []
-              environment = [
-                "RESOURCE_ABSTRACTOR_PORT=11011",
-                "CLOUD_MONGO_URL=root-mongo",
-                "CLOUD_MONGO_PORT=10007"
-              ]
-              labels = {
-                "com.centurylinklabs.watchtower.enable" = "true"
-              }
-            }
-            "cloud-scheduler" = {
-              image   = "oakestra/oakestra/cloud-scheduler:${var.oakestra_version}"
-              restart = "always"
-              ports   = var.debug_ports_enabled ? ["10004:10004"] : []
-              environment = [
-                "MY_PORT=10004",
-                "SYSTEM_MANAGER_URL=root-system-manager",
-                "SYSTEM_MANAGER_PORT=10000",
-                "RESOURCE_ABSTRACTOR_URL=root-resource-abstractor",
-                "RESOURCE_ABSTRACTOR_PORT=11011",
-                "REDIS_ADDR=redis://:cloudRedis@root-redis:6379",
-                "CLOUD_MONGO_URL=root-mongo",
-                "CLOUD_MONGO_PORT=10007"
-              ]
-              labels = {
-                "com.centurylinklabs.watchtower.enable" = "true"
-              }
-            }
-            "root-service-manager" = {
-              image   = "oakestra/oakestra-net/root-service-manager:${var.oakestra_version}"
-              restart = "always"
-              ports   = ["10099:10099"]
-              environment = [
-                "MY_PORT=10099",
-                "SYSTEM_MANAGER_URL=root-system-manager",
-                "SYSTEM_MANAGER_PORT=10000",
-                "CLOUD_MONGO_URL=root-mongo-net",
-                "CLOUD_MONGO_PORT=10008"
-              ]
-              labels = {
-                "com.centurylinklabs.watchtower.enable" = "true"
-              }
-            }
-            "dashboard" = {
-              image   = "oakestra/dashboard:${var.oakestra_dashboard_version}"
-              restart = "always"
-              ports   = ["80:80"]
-              environment = [
-                "API_ADDRESS=${local.root_orc_ipv4}:10000",
-              ]
-              labels = {
-                "com.centurylinklabs.watchtower.enable" = "true"
-              }
-            }
-            "root-mongo" = {
-              image   = "mongo:3.6"
-              restart = "always"
-              command = ["mongod", "--port", "10007"]
-              ports   = var.debug_ports_enabled ? ["10007:10007"] : []
-            }
-            "root-mongo-net" = {
-              image   = "mongo:3.6"
-              restart = "always"
-              command = ["mongod", "--port", "10008"]
-              ports   = var.debug_ports_enabled ? ["10008:10008"] : []
-            }
-            "root-redis" = {
-              image   = "redis:7.4.2"
-              restart = "always"
-              command = ["redis-server", "--requirepass", "cloudRedis"]
-              ports   = var.debug_ports_enabled ? ["6379:6379"] : []
-            }
-          }
-          networks = {
-            default = {
-              ipam = {
-                config = [
-                  {
-                    subnet = var.container_ipv4_cidr
-                  }
-                ]
-              }
-            }
-            watchtower = {
-              ipam = {
-                config = [
-                  {
-                    subnet   = var.watchtower_ipv4_cidr
-                    gateway  = cidrhost(var.watchtower_ipv4_cidr, 1)
-                    ip_range = cidrsubnet(var.watchtower_ipv4_cidr, 2, 2)
-                  }
-                ]
-              }
-            }
-          }
-        })
+        path        = "/etc/docker-compose/oakestra-root-orc/docker-compose.yml",
+        content     = yamlencode(local.root_orc_compose_full)
+        owner       = "root:root"
+        permissions = "0644"
+      },
+      {
+        path        = "/etc/docker-compose/oakestra-root-orc/.env",
+        content     = <<-EOT
+          OAKESTRA_VERSION="${var.oakestra_version}"
+          OAKESTRA_DASHBOARD_VERSION="${var.oakestra_dashboard_version}"
+          ROOT_ORC_IPV4="${local.root_orc_ipv4}"
+        EOT
         owner       = "root:root"
         permissions = "0644"
       },
@@ -270,6 +191,14 @@ resource "libvirt_cloudinit_disk" "root_orc" {
         EOT
         owner       = "root:root"
         permissions = "0644"
+      },
+      {
+        path        = "/root/.bashrc"
+        content     = <<-EOT
+          cd /etc/docker-compose/oakestra-root-orc
+        EOT
+        owner       = "root:root"
+        permissions = "0644"
       }
     ]
     runcmd = ["systemctl enable --now oakestra-root-orc"]
@@ -278,10 +207,14 @@ resource "libvirt_cloudinit_disk" "root_orc" {
 }
 
 resource "libvirt_domain" "root_orc" {
-  name      = "${local.setup_name}-root-orc"
-  memory    = 4096
-  vcpu      = 2
+  name      = "${var.setup_name}-root-orc"
+  memory    = var.root_orc_memory
+  vcpu      = var.root_orc_vcpu
   cloudinit = libvirt_cloudinit_disk.root_orc.id
+
+  cpu {
+    mode = "host-model"
+  }
 
   disk {
     volume_id = libvirt_volume.root_orc.id
@@ -301,21 +234,6 @@ resource "libvirt_domain" "root_orc" {
     type        = "pty"
     target_port = "0"
     target_type = "serial"
-  }
-
-  connection {
-    type        = "ssh"
-    host        = self.network_interface[0].addresses[0]
-    user        = "root"
-    private_key = tls_private_key.ssh_client.private_key_openssh
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "echo 'Waiting for cloud-init to finish...'",
-      "cloud-init status --wait > /dev/null",
-      "echo 'Done with waiting for cloud-init.'",
-    ]
   }
 
   lifecycle {

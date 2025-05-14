@@ -1,12 +1,11 @@
 resource "libvirt_cloudinit_disk" "worker" {
   for_each = { for cluster in local.clusters : cluster.name => cluster }
-  name     = "worker-init.iso"
+
+  name     = "${each.key}-worker-init.iso"
   pool     = libvirt_pool.oakestra_dev.name
   user_data = join("\n", ["#cloud-config", yamlencode({
     package_update = true
-    packages = [
-      "kitty-terminfo"
-    ]
+    packages = var.additional_packages
     growpart = {
       mode    = "auto"
       devices = ["/"]
@@ -99,7 +98,7 @@ resource "libvirt_cloudinit_disk" "worker" {
         path = "/etc/oakestra/conf.json"
         content = jsonencode({
           conf_version         = "1.0"
-          cluster_address      = libvirt_domain.cluster_orc[each.key].network_interface[0].hostname
+          cluster_address      = each.value.orc_ipv4
           cluster_port         = 10100
           app_logs             = "/tmp"
           overlay_network      = "default"
@@ -148,9 +147,7 @@ resource "libvirt_cloudinit_disk" "worker" {
       "mkdir -p /var/log/oakestra",
       # start containerd and Oakestra
       "systemctl daemon-reload",
-      "systemctl enable --now containerd",
-      "systemctl enable --now netmanager",
-      "systemctl enable --now nodeengine",
+      "systemctl enable --now containerd netmanager nodeengine",
     ]
   })])
   network_config = file("${path.module}/resources/ubuntu-network.yml")
@@ -158,7 +155,7 @@ resource "libvirt_cloudinit_disk" "worker" {
 
 resource "libvirt_volume" "worker" {
   for_each       = { for worker in local.workers : worker.name => worker }
-  name           = "${each.value.name}.iso"
+  name           = "${each.key}.iso"
   pool           = libvirt_pool.oakestra_dev.name
   base_volume_id = libvirt_volume.ubuntu_24_04.id
   size           = 16 * 1024 * 1024 * 1024 # 16 GiB
@@ -170,11 +167,15 @@ resource "libvirt_volume" "worker" {
 
 resource "libvirt_domain" "worker" {
   for_each = { for worker in local.workers : worker.name => worker }
-  name     = "${local.setup_name}-${each.value.name}"
+
+  name     = "${var.setup_name}-${each.key}"
   memory   = 4096
   vcpu     = 2
-  # cloudinit is different per cluster
   cloudinit = libvirt_cloudinit_disk.worker[each.value.cluster_name].id
+
+  cpu {
+    mode = "host-model"
+  }
 
   disk {
     volume_id = libvirt_volume.worker[each.key].id
@@ -196,22 +197,5 @@ resource "libvirt_domain" "worker" {
     target_type = "serial"
   }
 
-  connection {
-    type        = "ssh"
-    host        = self.network_interface[0].addresses[0]
-    user        = "root"
-    private_key = tls_private_key.ssh_client.private_key_openssh
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "echo 'Waiting for cloud-init to finish...'",
-      "cloud-init status --wait > /dev/null",
-      "echo 'Done with waiting for cloud-init.'",
-    ]
-  }
-
-  lifecycle {
-    replace_triggered_by = [libvirt_cloudinit_disk.worker]
-  }
+  depends_on = [libvirt_domain.registry]
 }
