@@ -1,11 +1,19 @@
 resource "libvirt_cloudinit_disk" "worker" {
   for_each = { for cluster in local.clusters : cluster.name => cluster }
 
-  name     = "${each.key}-worker-init.iso"
-  pool     = libvirt_pool.oakestra_dev.name
+  name = "${each.key}-worker-init.iso"
+  pool = libvirt_pool.oakestra_dev.name
   user_data = join("\n", ["#cloud-config", yamlencode({
     package_update = true
-    packages = var.additional_packages
+    packages = concat(var.additional_packages, [
+      "genisoimage",
+      "libvulkan1",
+      "libdrm2",
+      "libepoxy0",
+      "libcap2",
+      "libclang1",
+      "libx11-6"
+    ])
     growpart = {
       mode    = "auto"
       devices = ["/"]
@@ -22,6 +30,16 @@ resource "libvirt_cloudinit_disk" "worker" {
       ed25519_public  = tls_private_key.ssh_server.public_key_openssh
     }
     write_files = [
+      {
+        path        = "/etc/containers/registries.conf"
+        content     = <<-EOT
+          [[registry]]
+          location = "${local.registry_ipv4}:${local.registry_local_port}"
+          insecure = true
+        EOT
+        owner       = "root:root"
+        permissions = "0644"
+      },
       {
         path        = "/usr/local/lib/systemd/system/netmanager.service"
         content     = <<-EOT
@@ -57,6 +75,9 @@ resource "libvirt_cloudinit_disk" "worker" {
           ExecStart=/usr/local/bin/nodeengined
           StandardOutput=append:/var/log/oakestra/nodeengine.log
           StandardError=append:/var/log/oakestra/nodeengine.log
+          Environment="PATH=/opt/oakestra/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+          Environment="LD_LIBRARY_PATH=/opt/oakestra/lib"
+          Environment="OAKESTRA_CROSVM_DEBUG=true"
 
           [Install]
           WantedBy=multi-user.target
@@ -158,7 +179,7 @@ resource "libvirt_volume" "worker" {
   name           = "${each.key}.iso"
   pool           = libvirt_pool.oakestra_dev.name
   base_volume_id = libvirt_volume.ubuntu_24_04.id
-  size           = 16 * 1024 * 1024 * 1024 # 16 GiB
+  size           = each.value.disk * 1024 * 1024 # worker.disk is in MiB, size expects bytes
 
   lifecycle {
     replace_triggered_by = [libvirt_cloudinit_disk.worker]
@@ -168,13 +189,13 @@ resource "libvirt_volume" "worker" {
 resource "libvirt_domain" "worker" {
   for_each = { for worker in local.workers : worker.name => worker }
 
-  name     = "${var.setup_name}-${each.key}"
-  memory   = 4096
-  vcpu     = 2
+  name      = "${var.setup_name}-${each.key}"
+  memory    = each.value.memory
+  vcpu      = each.value.vcpu
   cloudinit = libvirt_cloudinit_disk.worker[each.value.cluster_name].id
 
   cpu {
-    mode = "host-model"
+    mode = "host-passthrough"
   }
 
   disk {

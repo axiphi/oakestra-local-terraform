@@ -43,7 +43,7 @@ resource "local_file" "ssh_config" {
          IdentityFile ${local_sensitive_file.ssh_key.filename}
          UserKnownHostsFile ${local_file.ssh_known_hosts.filename}
       EOT
-    ,
+      ,
       <<-EOT
         Host root-orc
          HostName ${local.root_orc_ipv4}
@@ -53,7 +53,7 @@ resource "local_file" "ssh_config" {
       EOT
     ],
     [for cluster in local.clusters : (
-    <<-EOT
+      <<-EOT
         Host ${cluster.name}-orc
          HostName ${cluster.orc_ipv4}
          User root
@@ -62,7 +62,7 @@ resource "local_file" "ssh_config" {
       EOT
     )],
     [for worker in local.workers : (
-    <<-EOT
+      <<-EOT
         Host ${worker.name}
          HostName ${worker.ipv4}
          User root
@@ -78,6 +78,13 @@ locals {
   worker_names = [for worker in local.workers : worker.name]
 }
 
+resource "local_file" "normalize_image_script" {
+  filename        = "${null_resource.oakestra_data_dir.triggers.oakestra_data_dir}/normalize-image.sh"
+  content         = file("${path.module}/resources/normalize-image.sh")
+  file_permission = "0744"
+}
+
+# TODO: support both podman and docker and push to registry directly instead of using "docker/podman save"
 resource "local_file" "init_script" {
   filename        = "${null_resource.oakestra_data_dir.triggers.oakestra_data_dir}/init.sh"
   content         = <<-EOT
@@ -99,7 +106,11 @@ resource "local_file" "init_script" {
           return 1
       fi
 
-      if command -v pv 2>&1 >/dev/null; then
+      if command -v podman 2>&1 >/dev/null; then
+        normalized_image="$(${local_file.normalize_image_script.filename} $1)"
+        retagged_image="${local.registry_ipv4}:${local.registry_local_port}/$${normalized_image}:${var.oakestra_version}"
+        podman push --tls-verify=false "$1" "docker://$${retagged_image}"
+      elif command -v pv 2>&1 >/dev/null; then
         docker save "$1" | pv -s $(docker image inspect "$1" --format='{{.Size}}') | gzip | ${var.setup_name}-ssh -q registry "zcat | restore-image.sh \"$1\""
       else
         docker save "$1" | gzip | ${var.setup_name}-ssh -q registry "zcat | restore-image.sh \"$1\""
@@ -114,8 +125,8 @@ resource "local_file" "init_script" {
 
       for worker in '${join("' '", local.worker_names)}'; do
         ${var.setup_name}-ssh -q "$${worker}" "systemctl stop nodeengine.service"
-        scp -q -p -F "/home/phiber/.local/share/oakestra-dev/oaks-1000/ssh_config" "$1" "$${worker}:/usr/local/bin/NodeEngine"
-        scp -q -p -F "/home/phiber/.local/share/oakestra-dev/oaks-1000/ssh_config" "$2" "$${worker}:/usr/local/bin/nodeengined"
+        scp -q -p -F "${local_file.ssh_config.filename}" "$1" "$${worker}:/usr/local/bin/NodeEngine"
+        scp -q -p -F "${local_file.ssh_config.filename}" "$2" "$${worker}:/usr/local/bin/nodeengined"
         ${var.setup_name}-ssh -q "$${worker}" "systemctl start nodeengine.service"
       done
     }
@@ -128,8 +139,25 @@ resource "local_file" "init_script" {
 
       for worker in '${join("' '", local.worker_names)}'; do
         ${var.setup_name}-ssh -q "$${worker}" "systemctl stop netmanager.service"
-        scp -q -p -F "/home/phiber/.local/share/oakestra-dev/oaks-1000/ssh_config" "$1" "$${worker}:/usr/local/bin/NetManager"
+        scp -q -p -F "${local_file.ssh_config.filename}" "$1" "$${worker}:/usr/local/bin/NetManager"
         ${var.setup_name}-ssh -q "$${worker}" "systemctl start netmanager.service"
+      done
+    }
+
+    ${var.setup_name}-third-party-push() {
+      if [ $# -ne 1 ]; then
+        echo "Error: ${var.setup_name}-third-party-push expects exactly one argument." >&2
+        return 1
+      fi
+
+      for worker in '${join("' '", local.worker_names)}'; do
+        ${var.setup_name}-ssh -q "$${worker}" "systemctl stop nodeengine.service netmanager.service"
+        ${var.setup_name}-ssh -q "$${worker}" '
+          rm --recursive --force /opt/oakestra \
+          && mkdir --parents /opt/oakestra \
+          && tar --extract --gzip --directory=/opt/oakestra
+        ' < $1
+        ${var.setup_name}-ssh -q "$${worker}" "systemctl start nodeengine.service netmanager.service"
       done
     }
   EOT

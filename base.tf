@@ -47,6 +47,7 @@ locals {
       mac           = format("52:54:00:22:%02X:%02X", cluster_idx + 3, worker_idx + 1)
       memory        = worker.memory
       vcpu          = worker.vcpu
+      disk          = worker.disk
       cluster_index = cluster_idx
       cluster_name  = "cluster-${cluster_idx + 1}"
     }]

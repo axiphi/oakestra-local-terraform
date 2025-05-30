@@ -206,7 +206,7 @@ resource "libvirt_volume" "cluster_orc" {
 }
 
 resource "libvirt_domain" "cluster_orc" {
-  for_each  = { for cluster in local.clusters : cluster.name => cluster }
+  for_each = { for cluster in local.clusters : cluster.name => cluster }
 
   name      = "${var.setup_name}-${each.key}-orc"
   memory    = each.value.orc_memory

@@ -64,6 +64,7 @@ variable "clusters" {
     workers = list(object({
       memory = number
       vcpu   = number
+      disk   = number
     }))
   }))
   default = [{
@@ -73,7 +74,8 @@ variable "clusters" {
     workers = [
       {
         memory = 2048
-        vcpu   = 1
+        vcpu   = 2
+        disk   = 16384
       }
     ]
   }]
